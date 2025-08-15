@@ -1,6 +1,5 @@
 ---
   # title: "**Detecting Fraud**"
-  # subtitle: "Part 2: Supervised and Unsupervised Learning"
   
   # Libraries
   library(ggplot2) # plot library
@@ -131,7 +130,6 @@ draw_confusion_matrix <- function(cm) {
 
 
 ## Feature Engineering
-# The feature engineering could arguably be the utmost important step during the preprocessing part of a modeling problem. It has the purpose to transform raw data into dimensionalities that can be better understood by a predictive model, hence it remarkably improves the evaluation metrics. Another important step in the feature engineering process is making sure that there are no features used to train the model that would not be available when a new case would come.
 
 # **Steps:**
 # 
@@ -274,7 +272,7 @@ pca_data %>%
 
 
 ## Class Imbalance
-# As stated before, the fraud and non-fraud cases available in the present dataset have extremely imbalanced weights, with only 1.2% out of the total cases being fraud. Therefore, there are only 7,000 observations labeled as fraud, while the rest 580,000 observations are labeled as clean transactions.
+# The fraud and non-fraud cases available in the present dataset have extremely imbalanced weights, with only 1.2% out of the total cases being fraud. Therefore, there are only 7,000 observations labeled as fraud, while the rest 580,000 observations are labeled as clean transactions.
 
 # In a classification problem, this would create difficulties for a model to correctly identify the fraud label, because it is so scarce throughout the dataset. 
 # 
@@ -325,20 +323,23 @@ dim(undersampling_data)
 ### Models
 
 # * 75% train and 25% test (and for the 75% uses cross validation)
-# 
+# DBSCAN
+# * Classification and Regression Trees CART `rpart`
+# * Random Forest `ranger`
+# K means
+# * Flexible Discriminant Analysis `fda`
+# * eXtreme Gradient Boosting `xgbDART`, `xgbLinear`, `xgbTree`
+
+# Later:
 # * Generalized Linear Model `glm`
 # * Linear Discriminant Analysis `lda`
 # * Neural Network `nnet`
-# * Flexible Discriminant Analysis `fda`
 # * Support Vector Machines with Class Weights `svmRadialWeights`
 # * k-Nearest Neighbors `knn`
 # * Naive Bayes `naive_bayes`
-# * Classification and Regression Trees CART `rpart`
 # * C4.5-like Trees `J48`
 # * Rule-Based Classifier `PART`
-# * Random Forest `ranger`
 # * AdaBoost Classification Trees `adaboost`
-# * eXtreme Gradient Boosting `xgbDART`, `xgbLinear`, `xgbTree`
 
 # For the purpose of this analysis, I will exclude most models from the `caretList()`.
 ```{r message=FALSE, warning=FALSE, echo = T, results = 'hide'}
@@ -500,10 +501,75 @@ my_control <- trainControl(method = 'cv', number = 5, index = myFolds,
                            preProcOptions = c(thresh = 0.8), allowParallel = T)
 
 # ------------------------- Train and Validation Models -------------------------
+library(caret)
+library(ParBayesianOptimization)
+library(xgboost)
+
+# Define the function to optimize
+xgb_bayes_func <- function(nrounds, max_depth, eta, gamma, colsample_bytree, min_child_weight, subsample) {
+  set.seed(123)
+  model <- train(
+    X_train5, y_train5,
+    method = "xgbTree",
+    trControl = trainControl(method = "cv", number = 5),
+    tuneGrid = expand.grid(
+      nrounds = round(nrounds),
+      max_depth = round(max_depth),
+      eta = eta,
+      gamma = gamma,
+      colsample_bytree = colsample_bytree,
+      min_child_weight = min_child_weight,
+      subsample = subsample
+    ),
+    preProcess = c("center", "scale")
+  )
+  
+  acc <- max(model$results$Accuracy)
+  return(list(Score = acc))
+}
+
+# Run Bayesian Optimization
+bounds <- list(
+  nrounds = c(50L, 500L),
+  max_depth = c(2L, 10L),
+  eta = c(0.01, 0.3),
+  gamma = c(0, 5),
+  colsample_bytree = c(0.5, 1),
+  min_child_weight = c(1, 10),
+  subsample = c(0.5, 1)
+)
+
+opt_results <- bayesOpt(
+  FUN = xgb_bayes_func,
+  bounds = bounds,
+  initPoints = 5,
+  iters.n = 15,
+  acq = "ei"
+)
+
+best_params <- getBestPars(opt_results)
+
+library(cluster)
+
+sil_scores <- sapply(2:10, function(k) {
+  km <- kmeans(scale(X_train5), centers = k, nstart = 25)
+  ss <- silhouette(km$cluster, dist(scale(X_train5)))
+  mean(ss[, 3])  # Average silhouette width
+})
+
+best_k <- which.max(sil_scores) + 1
+best_k  # optimal number of clusters
 
 # XGBTree Model
 xgbTree_rwo <- train(X_train5, y_train5, method = 'xgbTree', trControl = my_control,
                      preProcess = c('zv', 'center', 'scale'))
+# K-Means Model
+kmeans_rwo <- train(X_train5, y_train5, method = 'kmeans', trControl = my_control,
+                    preProcess = c('zv', 'center', 'scale'))
+
+# DBSCAN Model
+dbscan_rwo <- train(X_train5, y_train5, method = 'dbscan', trControl = my_control,
+                    preProcess = c('zv', 'center', 'scale'))
 
 # fda Model
 fda_rwo <- train(X_train5, y_train5, method = 'fda', trControl = my_control,
@@ -529,6 +595,8 @@ dotplot(resamples_rwo, metric = "Spec")
 # Final Predictions
 pred_xgbTree_rwo <- predict.train(xgbTree_rwo, newdata = X_test5)
 pred_fda_rwo <- predict.train(fda_rwo, newdata = X_test5)
+pred_kmeans_rwo <- predict(kmeans_rwo, newdata = X_test5)
+pred_dbscan_rwo <- predict(dbscan_rwo, newdata = X_test5)
 
 # Check Sens
 preds_sens_rwo <- data.frame(xgbTree = sensitivity(as.factor(pred_xgbTree_rwo), as.factor(y_test5)),
@@ -539,6 +607,28 @@ print(preds_sens_rwo)
 # Confusion Matrix
 cm_tree_rwo <- confusionMatrix(as.factor(pred_xgbTree_rwo), as.factor(y_test5))
 draw_confusion_matrix(cm_tree_rwo)
+
+# Check Sensitivity
+preds_sens_rwo <- data.frame(
+  xgbTree = sensitivity(as.factor(pred_xgbTree_rwo), as.factor(y_test5)),
+  fda     = sensitivity(as.factor(pred_fda_rwo), as.factor(y_test5)),
+  kmeans  = sensitivity(as.factor(pred_kmeans_rwo), as.factor(y_test5)),
+  dbscan  = sensitivity(as.factor(pred_dbscan_rwo), as.factor(y_test5))
+)
+print(preds_sens_rwo)
+
+# Confusion Matrices
+cm_xgbTree_rwo <- confusionMatrix(as.factor(pred_xgbTree_rwo), as.factor(y_test5))
+cm_fda_rwo     <- confusionMatrix(as.factor(pred_fda_rwo), as.factor(y_test5))
+cm_kmeans_rwo  <- confusionMatrix(as.factor(pred_kmeans_rwo), as.factor(y_test5))
+cm_dbscan_rwo  <- confusionMatrix(as.factor(pred_dbscan_rwo), as.factor(y_test5))
+
+# Draw Confusion Matrices
+draw_confusion_matrix(cm_xgbTree_rwo)
+draw_confusion_matrix(cm_fda_rwo)
+draw_confusion_matrix(cm_kmeans_rwo)
+draw_confusion_matrix(cm_dbscan_rwo)
+
 
 
 # Create feature importance
@@ -661,7 +751,6 @@ draw_confusion_matrix <- function(cm) {
 #  * 6424 NF, 78 F
 #  * best number of clusters: 3
 #                                                       
-# > Note: Because the following chunk takes too much to run, I will leave it just commented
 
 ```{r}
 # # ================= SCALE DATA =================
@@ -877,4 +966,5 @@ cluster_2 %>%
   filter(fraud == "F") %>% 
   summarise(mean(amount))
 ```
+
 
