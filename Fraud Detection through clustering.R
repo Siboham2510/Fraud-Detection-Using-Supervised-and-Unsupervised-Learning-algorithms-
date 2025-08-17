@@ -941,7 +941,7 @@ cluster_1 %>%
 cluster_2 <- kmeans_data_final %>% 
   filter(cluster == 2)
 
-# Inpect data
+# Inspect data
 dim(cluster_2)
 table(cluster_2$fraud)
 
@@ -965,6 +965,151 @@ cluster_2 %>%
 cluster_2 %>% 
   filter(fraud == "F") %>% 
   summarise(mean(amount))
+
+# =============================
+# Fraud Detection with Bayesian Tuning
+# =============================
+# -----------------------------
+# Load your dataset
+# -----------------------------
+df = pd.read_csv("fraud_data.csv")   # change to your filename
+X = df.drop("isFraud", axis=1).values
+y = df["isFraud"].values
+
+# Train-test split
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+
+# -----------------------------
+# 1. XGBoost with Bayesian Optimization
+# -----------------------------
+def xgb_eval(max_depth, learning_rate, n_estimators, subsample):
+    params = {
+        "max_depth": int(max_depth),
+        "learning_rate": learning_rate,
+        "n_estimators": int(n_estimators),
+        "subsample": max(min(subsample, 1), 0),
+        "eval_metric": "logloss",
+        "use_label_encoder": False,
+        "verbosity": 0
+    }
+    model = XGBClassifier(**params)
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
+    return accuracy_score(y_test, preds)  # maximize accuracy
+
+
+pbounds = {
+    "max_depth": (3, 8),
+    "learning_rate": (0.01, 0.3),
+    "n_estimators": (50, 300),
+    "subsample": (0.5, 1.0)
+}
+
+xgb_bo = BayesianOptimization(f=xgb_eval, pbounds=pbounds, random_state=42, verbose=2)
+xgb_bo.maximize(init_points=5, n_iter=10)
+
+best_params = xgb_bo.max["params"]
+best_params["max_depth"] = int(best_params["max_depth"])
+best_params["n_estimators"] = int(best_params["n_estimators"])
+
+xgb_model = XGBClassifier(**best_params, eval_metric="logloss", use_label_encoder=False)
+xgb_model.fit(X_train, y_train)
+xgb_preds = xgb_model.predict(X_test)
+
+print("\n📌 XGBoost Test Accuracy:", accuracy_score(y_test, xgb_preds))
+print("Confusion Matrix:\n", confusion_matrix(y_test, xgb_preds))
+
+
+# -----------------------------
+# 2. KMeans with Bayesian Optimization
+# -----------------------------
+def kmeans_eval(n_clusters):
+    n_clusters = int(n_clusters)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    kmeans.fit(X_train)
+    cluster_labels = kmeans.predict(X_test)
+
+    # Map clusters to actual labels using majority vote
+    label_map = {}
+    for cluster in np.unique(kmeans.labels_):
+        majority_label = Counter(y_train[kmeans.labels_ == cluster]).most_common(1)[0][0]
+        label_map[cluster] = majority_label
+
+    mapped_preds = np.array([label_map[c] for c in cluster_labels])
+    return accuracy_score(y_test, mapped_preds)
+
+
+pbounds_kmeans = {"n_clusters": (2, 6)}
+
+kmeans_bo = BayesianOptimization(f=kmeans_eval, pbounds=pbounds_kmeans, random_state=42, verbose=2)
+kmeans_bo.maximize(init_points=3, n_iter=7)
+
+best_k = int(kmeans_bo.max["params"]["n_clusters"])
+kmeans_model = KMeans(n_clusters=best_k, random_state=42, n_init=10)
+kmeans_model.fit(X_train)
+cluster_labels_test = kmeans_model.predict(X_test)
+
+label_map = {}
+for cluster in np.unique(kmeans_model.labels_):
+    majority_label = Counter(y_train[kmeans_model.labels_ == cluster]).most_common(1)[0][0]
+    label_map[cluster] = majority_label
+
+kmeans_preds = np.array([label_map[c] for c in cluster_labels_test])
+print("\n📌 KMeans Test Accuracy:", accuracy_score(y_test, kmeans_preds))
+print("Confusion Matrix:\n", confusion_matrix(y_test, kmeans_preds))
+
+
+# -----------------------------
+# 3. DBSCAN with Bayesian Optimization
+# -----------------------------
+def dbscan_eval(eps, min_samples):
+    dbscan = DBSCAN(eps=eps, min_samples=int(min_samples))
+    dbscan.fit(X_train)
+
+    if len(set(dbscan.labels_)) <= 1:  # DBSCAN failed to find clusters
+        return 0
+
+    cluster_labels = dbscan.fit_predict(X_test)
+
+    # Map clusters to labels
+    label_map = {}
+    for cluster in set(dbscan.labels_):
+        if cluster == -1:  # noise
+            label_map[cluster] = 0
+        else:
+            majority_label = Counter(y_train[dbscan.labels_ == cluster]).most_common(1)[0][0]
+            label_map[cluster] = majority_label
+
+    mapped_preds = np.array([label_map.get(c, 0) for c in cluster_labels])
+    return accuracy_score(y_test, mapped_preds)
+
+
+pbounds_dbscan = {"eps": (0.1, 5.0), "min_samples": (3, 10)}
+
+dbscan_bo = BayesianOptimization(f=dbscan_eval, pbounds=pbounds_dbscan, random_state=42, verbose=2)
+dbscan_bo.maximize(init_points=3, n_iter=7)
+
+best_eps = dbscan_bo.max["params"]["eps"]
+best_min = int(dbscan_bo.max["params"]["min_samples"])
+
+dbscan_model = DBSCAN(eps=best_eps, min_samples=best_min)
+dbscan_model.fit(X_train)
+
+dbscan_test_preds = dbscan_model.fit_predict(X_test)
+label_map = {}
+for cluster in set(dbscan_model.labels_):
+    if cluster == -1:
+        label_map[cluster] = 0
+    else:
+        majority_label = Counter(y_train[dbscan_model.labels_ == cluster]).most_common(1)[0][0]
+        label_map[cluster] = majority_label
+
+dbscan_preds = np.array([label_map.get(c, 0) for c in dbscan_test_preds])
+print("\n📌 DBSCAN Test Accuracy:", accuracy_score(y_test, dbscan_preds))
+print("Confusion Matrix:\n", confusion_matrix(y_test, dbscan_preds))
+
 ```
+
 
 
